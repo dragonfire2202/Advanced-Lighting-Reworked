@@ -1,0 +1,207 @@
+import groovy.json.JsonSlurper
+
+import java.util.concurrent.*
+
+// Mindustry/Arc classes are taken from the game's own release jar (`Mindustry.jar`), which bundles Arc as well.
+// This replaces the old JitPack setup and the Java 8 syntax downgrader: Mindustry v8 mods are plain Java 17.
+configure(allprojects){
+    apply plugin: 'java'
+
+    // Main source directory.
+    sourceSets.main.java.srcDirs = ['src/']
+
+    repositories{
+        mavenCentral()
+        ivy{
+            url = uri('https://github.com')
+            patternLayout{
+                artifact 'Anuken/Mindustry/releases/download/[revision]/Mindustry.jar'
+            }
+            metadataSources{artifact()}
+            content{includeModule('Anuken', 'Mindustry')}
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach{
+        options.release.set 17
+        options.compilerArgs << '-Xlint:-options'
+
+        options.incremental = true
+        options.encoding = 'UTF-8'
+    }
+}
+
+void fetchSprites(final String mindustryVersion, final File baseDir){
+    final def downloads = []
+    listSprites("https://api.github.com/repos/Anuken/Mindustry/contents/core/assets-raw/sprites/units?ref=$mindustryVersion", baseDir, downloads)
+
+    logger.lifecycle "Fetching ${downloads.size()} unit sprites."
+
+    final def exec = Executors.newFixedThreadPool(Math.max(1, Runtime.runtime.availableProcessors()))
+    try{
+        final def fetches = downloads.collect{ entry ->
+            exec.submit({
+                final File out = entry[0]
+                out.parentFile.mkdirs()
+                openConnection(entry[1]).inputStream.withStream{ input -> out.withOutputStream{ output -> output << input } }
+            } as Callable)
+        }
+        fetches.each{it.get()}
+    }finally{
+        exec.shutdown()
+    }
+}
+
+URLConnection openConnection(final String url){
+    final def conn = new URL(url).openConnection()
+    conn.setRequestProperty('Accept', 'application/vnd.github+json')
+
+    // Unauthenticated GitHub API requests are limited to 60/hour; a token raises that.
+    final def token = System.getenv('GITHUB_TOKEN')
+    if(token) conn.setRequestProperty('Authorization', "Bearer $token")
+    return conn
+}
+
+void listSprites(final String url, final File dir, final List downloads){
+    final def list = new JsonSlurper().parse(openConnection(url).inputStream.newReader('UTF-8'))
+    for(final def val : list){
+        final String name = val.name
+        switch(val.type){
+            case 'file':
+                if(name.endsWith('.png')) downloads << [new File(dir, name), val.download_url as String]
+                break
+            case 'dir':
+                listSprites(val.url as String, new File(dir, name), downloads)
+                break
+        }
+    }
+}
+
+configure(project(':proc')){
+    tasks.register('fetchSprites'){
+        final def fetchOutputProv = layout.buildDirectory.dir('fetched')
+        doFirst{
+            def fetchOutput = fetchOutputProv.get().asFile
+            fetchOutput.deleteDir()
+            fetchOutput.mkdir()
+
+            fetchSprites(mindustryVersion, fetchOutput)
+            file("$fetchOutput/cache.txt").text = mindustryVersion
+        }
+
+        outputs.dir fetchOutputProv
+        outputs.upToDateWhen{
+            def fetchOutput = fetchOutputProv.get().asFile
+            def cache = file("$fetchOutput/cache.txt")
+            cache.exists() && cache.text == mindustryVersion
+        }
+    }
+
+    tasks.register('genSprites', JavaExec){
+        dependsOn fetchSprites, configurations.runtimeClasspath
+
+        final def genOutputProv = layout.buildDirectory.dir('output')
+        final def fetchSpritesProv = layout.buildDirectory.dir('fetched')
+
+        mainClass = 'lights.gen.Generator'
+        classpath = sourceSets.main.runtimeClasspath
+        standardInput = System.in
+        workingDir = genOutputProv.map{it.dir('sprites').dir('units')}
+
+        doFirst{
+            def genOutput = genOutputProv.get().dir('sprites').dir('units').asFile
+            genOutput.deleteDir()
+            genOutput.mkdirs()
+
+            args fetchSpritesProv.get().asFile
+        }
+
+        doLast{
+            def genOutput = genOutputProv.get().asFile
+            file("$genOutput/cache.txt").text = mindustryVersion
+        }
+
+        outputs.dir genOutputProv
+        outputs.upToDateWhen{
+            def genOutput = genOutputProv.get().asFile
+            def cache = file("$genOutput/cache.txt")
+            cache.exists() && cache.text == mindustryVersion
+        }
+    }
+
+    dependencies{
+        // Depend on Mindustry/Arc classpath (the release jar bundles Arc and its natives).
+        implementation "Anuken:Mindustry:$mindustryVersion"
+    }
+}
+
+configure(rootProject){
+    // `gradlew jar -PskipGen` skips generating glow sprites for vanilla units (useful if the generator breaks on a new game version).
+    final boolean skipGen = project.hasProperty('skipGen')
+
+    jar{
+        if(!skipGen) inputs.files project(':proc').tasks.genSprites
+        archiveFileName = "${rootProject.name}-Desktop.jar"
+
+        from files(sourceSets.main.output.classesDirs)
+        from files(sourceSets.main.output.resourcesDir)
+        from configurations.runtimeClasspath.collect{it.isDirectory() ? it : zipTree(it)}
+
+        from(layout.projectDirectory){
+            include 'mod.json'
+            include 'icon.png'
+        }
+
+        from files(layout.projectDirectory.dir('assets'))
+        if(!skipGen){
+            from files(project(':proc').layout.buildDirectory.dir('output')){
+                exclude 'cache.txt'
+            }
+        }
+    }
+
+    tasks.register('dex', Jar){
+        inputs.files tasks.jar
+        archiveFileName = "${rootProject.name}.jar"
+
+        final def desktopJar = tasks.jar.archiveFile
+        final def dexJar = file("$temporaryDir/Dexed.jar")
+
+        from zipTree(desktopJar), zipTree(dexJar)
+        doFirst{
+            def sdkRoot = file(
+                System.getenv('ANDROID_SDK_ROOT') ?: System.getenv('ANDROID_HOME') ?:
+                { throw new GradleException('Neither `ANDROID_SDK_ROOT` nor `ANDROID_HOME` is set') }
+            )
+
+            final boolean windows = System.getProperty('os.name').toLowerCase().contains('windows')
+            def d8 = file("$sdkRoot/build-tools/$androidBuildVersion/${windows ? 'd8.bat' : 'd8'}")
+            if(!d8.exists()){
+                throw new GradleException("Android SDK `build-tools;$androidBuildVersion` isn't installed or is corrupted")
+            }
+
+            def input = desktopJar.get().asFile
+            def command = "$d8 --release --min-api $androidMinVersion --output $dexJar $input"
+
+            (configurations.compileClasspath.asList() + configurations.runtimeClasspath.asList()).forEach{
+                if(it.exists()) command = "$command --classpath $it"
+            }
+
+            def androidJar = file("$sdkRoot/platforms/android-$androidSdkVersion/android.jar")
+            if(!androidJar.exists()){
+                throw new GradleException("Android SDK `platforms;android-$androidSdkVersion` isn't installed or is corrupted")
+            }
+
+            command = "$command --lib $androidJar"
+            if(windows) command = "cmd /c $command"
+
+            logger.log(LogLevel.LIFECYCLE, 'Running `d8`.')
+            command.execute(null, layout.projectDirectory.asFile).waitForProcessOutput(System.out, System.err)
+        }
+    }
+
+    dependencies{
+        // Depend on Mindustry/Arc classpath.
+        compileOnly "Anuken:Mindustry:$mindustryVersion"
+    }
+}

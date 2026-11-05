@@ -1,0 +1,11 @@
+{
+    "name": "advance-lighting",
+    "displayName": "Advance lighting",
+    "author": "EoD, Ported By: DragonFire",
+    "description": "Mod adds a glow and bloom lighting system to Mindustry. Not recommended for weak devices. Only supports Vanilla/Supported-Json content. This mod replaces/add some effects, and may cause issues with mods that actively check on those effects.",
+    "version": "v1.7.0",
+    "minGameVersion": "160",
+    "main": "lights.AdvanceLighting",
+    "hidden": true,
+    "java": true
+}
